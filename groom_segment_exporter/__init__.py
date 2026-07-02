@@ -24,6 +24,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix, Vector
+from mathutils.geometry import barycentric_transform
 
 
 ADDON_COLLECTION = "UE_Groom_Export"
@@ -415,21 +416,141 @@ def iter_curve_point_lists(obj: bpy.types.Object):
                 yield points
 
 
-def write_gse_curve_data(data_path: str, curve_objects: list[bpy.types.Object], system_reports: list[dict]) -> dict:
+def mesh_uv_at_world_position(
+    emitter: bpy.types.Object | None,
+    world_position: Vector,
+    uv_map_name: str = "",
+) -> tuple[float, float, bool]:
+    if not emitter or emitter.type != "MESH" or not emitter.data:
+        return 0.0, 0.0, False
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = emitter.evaluated_get(depsgraph)
+    mesh = eval_obj.data
+    uv_layer = mesh.uv_layers.get(uv_map_name) if uv_map_name else mesh.uv_layers.active
+    if uv_layer is None:
+        return 0.0, 0.0, False
+
+    try:
+        local_position = eval_obj.matrix_world.inverted() @ world_position
+        hit, hit_position, _normal, face_index = eval_obj.closest_point_on_mesh(local_position)
+    except RuntimeError:
+        return 0.0, 0.0, False
+
+    if not hit or face_index < 0 or face_index >= len(mesh.polygons):
+        return 0.0, 0.0, False
+
+    polygon = mesh.polygons[face_index]
+    loop_indices = list(polygon.loop_indices)
+    if len(loop_indices) < 3:
+        return 0.0, 0.0, False
+
+    best_uv = None
+    best_distance = None
+    origin_loop = loop_indices[0]
+    for i in range(1, len(loop_indices) - 1):
+        tri_loops = (origin_loop, loop_indices[i], loop_indices[i + 1])
+        tri_positions = [
+            mesh.vertices[mesh.loops[loop_index].vertex_index].co
+            for loop_index in tri_loops
+        ]
+        tri_uvs = [
+            Vector((uv_layer.data[loop_index].uv.x, uv_layer.data[loop_index].uv.y, 0.0))
+            for loop_index in tri_loops
+        ]
+        uv = barycentric_transform(
+            hit_position,
+            tri_positions[0],
+            tri_positions[1],
+            tri_positions[2],
+            tri_uvs[0],
+            tri_uvs[1],
+            tri_uvs[2],
+        )
+        projected = barycentric_transform(
+            uv,
+            tri_uvs[0],
+            tri_uvs[1],
+            tri_uvs[2],
+            tri_positions[0],
+            tri_positions[1],
+            tri_positions[2],
+        )
+        distance = (projected - hit_position).length_squared
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_uv = uv
+
+    if best_uv is None:
+        return 0.0, 0.0, False
+    return float(best_uv.x), float(best_uv.y), True
+
+
+def root_uvs_for_curve_object(
+    obj: bpy.types.Object,
+    emitter_name: str,
+    uv_map_name: str = "",
+) -> tuple[list[tuple[float, float]], int]:
+    emitter = bpy.data.objects.get(emitter_name) if emitter_name else None
+    root_uvs: list[tuple[float, float]] = []
+    misses = 0
+
+    if obj.type == "CURVES":
+        for curve in obj.data.curves:
+            points = list(curve.points)
+            if len(points) < 2:
+                continue
+            world_root = obj.matrix_world @ points[0].position
+            u, v, ok = mesh_uv_at_world_position(emitter, world_root, uv_map_name)
+            root_uvs.append((u, v))
+            if not ok:
+                misses += 1
+    elif obj.type == "CURVE":
+        for spline in obj.data.splines:
+            if hasattr(spline, "points"):
+                points = list(spline.points)
+                if len(points) < 2:
+                    continue
+                point = points[0]
+                w = point.co.w if point.co.w else 1.0
+                local_root = Vector((point.co.x / w, point.co.y / w, point.co.z / w))
+            else:
+                points = list(spline.bezier_points)
+                if len(points) < 2:
+                    continue
+                local_root = points[0].co
+            world_root = obj.matrix_world @ local_root
+            u, v, ok = mesh_uv_at_world_position(emitter, world_root, uv_map_name)
+            root_uvs.append((u, v))
+            if not ok:
+                misses += 1
+
+    return root_uvs, misses
+
+
+def write_gse_curve_data(
+    data_path: str,
+    curve_objects: list[bpy.types.Object],
+    system_reports: list[dict],
+    root_uvs_by_object: dict[str, list[tuple[float, float]]] | None = None,
+    groom_width: float = 0.01,
+) -> dict:
     groups = []
     with open(data_path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("GSE_CURVES_V1\n")
+        handle.write("GSE_CURVES_V2\n")
         for index, obj in enumerate(curve_objects):
             report = system_reports[index] if index < len(system_reports) else {}
             raw_name = f"G{index:03d}_{report.get('emitter', obj.name)}_{report.get('particle_system', obj.name)}"
             abc_name = clean_abc_object_name(raw_name)
             curve_count = 0
             point_count = 0
-            handle.write(f"GROUP {index} {abc_name}\n")
+            root_uvs = root_uvs_by_object.get(obj.name, []) if root_uvs_by_object else []
+            handle.write(f"GROUP {index} {abc_name} {float(groom_width):.9g}\n")
             for points in iter_curve_point_lists(obj):
+                root_u, root_v = root_uvs[curve_count] if curve_count < len(root_uvs) else (0.0, 0.0)
                 curve_count += 1
                 point_count += len(points)
-                handle.write(f"CURVE {len(points)}\n")
+                handle.write(f"CURVE {len(points)} {root_u:.9g} {root_v:.9g}\n")
                 for x, y, z in points:
                     handle.write(f"{x:.9g} {y:.9g} {z:.9g}\n")
             handle.write("ENDGROUP\n")
@@ -438,8 +559,10 @@ def write_gse_curve_data(data_path: str, curve_objects: list[bpy.types.Object], 
                     "object": obj.name,
                     "abc_object": abc_name,
                     "groom_group_id": index,
+                    "groom_width": float(groom_width),
                     "curve_count": curve_count,
                     "point_count": point_count,
+                    "root_uv_count": len(root_uvs),
                     "source_emitter": report.get("emitter", ""),
                     "source_particle_system": report.get("particle_system", ""),
                 }
@@ -452,10 +575,12 @@ def export_curve_objects_with_groom_schema(
     filepath: str,
     curve_objects: list[bpy.types.Object],
     system_reports: list[dict],
+    root_uvs_by_object: dict[str, list[tuple[float, float]]] | None = None,
+    groom_width: float = 0.01,
 ) -> dict:
     writer = groom_abc_writer_path()
     data_path = os.path.join(tempfile.gettempdir(), "groom_segment_exporter_curves.gsedata")
-    data_summary = write_gse_curve_data(data_path, curve_objects, system_reports)
+    data_summary = write_gse_curve_data(data_path, curve_objects, system_reports, root_uvs_by_object, groom_width)
     command = [str(writer), data_path, filepath]
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -471,6 +596,8 @@ def export_curve_objects_with_groom_schema(
         "writer_mode": "UE Groom Alembic schema writer",
         "schema_attributes": {
             "groom_group_id": "int32 Constant scope per ICurves group",
+            "groom_width": "float32 Constant scope per ICurves group",
+            "groom_root_uv": "float32[2] Uniform scope per curve",
         },
         "groups": data_summary["groups"],
         "stdout": result.stdout.strip(),
@@ -483,6 +610,8 @@ def export_particle_hair_as_curves_only(
     emitter_objects: list[bpy.types.Object],
     system_reports_override: list[dict] | None = None,
     mirror_y_before_export: bool = True,
+    groom_width: float = 0.01,
+    root_uv_map_name: str = "",
 ) -> dict:
     original_active = bpy.context.view_layer.objects.active
     original_selection = list(bpy.context.selected_objects)
@@ -510,6 +639,8 @@ def export_particle_hair_as_curves_only(
         export_matrix_note = "+Z 朝上，+Y 朝前；已开启 Y 坐标镜像补偿。" if mirror_y_before_export else "+Z 朝上，+Y 朝前；未开启 Y 坐标镜像补偿。"
         transform_summary = []
         group_attribute_summary = []
+        root_uvs_by_object: dict[str, list[tuple[float, float]]] = {}
+        root_uv_summary = []
         for index, obj in enumerate(curve_objects):
             system_report = system_reports[index] if index < len(system_reports) else {}
             group_label = clean_name(
@@ -522,10 +653,31 @@ def export_particle_hair_as_curves_only(
             obj["source_particle_system"] = system_report.get("particle_system", "")
             obj["source_pipeline"] = "Blender 粒子毛发临时 Alembic -> 提取 Curves -> UE curves-only Alembic"
             obj["axis_policy"] = f"{export_matrix_note} 对象矩阵已烘焙到曲线点数据。"
+            root_uvs, root_uv_misses = root_uvs_for_curve_object(
+                obj,
+                system_report.get("emitter", ""),
+                root_uv_map_name,
+            )
+            root_uvs_by_object[obj.name] = root_uvs
+            root_uv_summary.append(
+                {
+                    "object": obj.name,
+                    "source_emitter": system_report.get("emitter", ""),
+                    "uv_map": root_uv_map_name or "active",
+                    "root_uv_count": len(root_uvs),
+                    "root_uv_misses": root_uv_misses,
+                }
+            )
             transform_summary.append(transform_curve_object_data(obj, mirror_matrix @ axis_matrix @ obj.matrix_world))
             group_attribute_summary.append(set_curve_group_attribute(obj, index))
 
-        writer_summary = export_curve_objects_with_groom_schema(filepath, curve_objects, system_reports)
+        writer_summary = export_curve_objects_with_groom_schema(
+            filepath,
+            curve_objects,
+            system_reports,
+            root_uvs_by_object,
+            groom_width,
+        )
 
         curve_summary = []
         for obj in curve_objects:
@@ -549,6 +701,9 @@ def export_particle_hair_as_curves_only(
             "temp_alembic": temp_path,
             "axis_policy": f"{export_matrix_note} 对象矩阵已烘焙到曲线点数据，最终 Curves 对象为 identity transform。",
             "mirror_y_before_export": bool(mirror_y_before_export),
+            "groom_width": float(groom_width),
+            "root_uv_map": root_uv_map_name or "active",
+            "root_uv_summary": root_uv_summary,
             "transform_summary": transform_summary,
             "group_attribute_summary": group_attribute_summary,
             "writer_summary": writer_summary,
@@ -593,6 +748,8 @@ def export_particle_systems_split_by_system(
     filename: str,
     allowed_emitters: set[bpy.types.Object],
     mirror_y_before_export: bool = True,
+    groom_width: float = 0.01,
+    root_uv_map_name: str = "",
 ) -> dict:
     stem = Path(filename).stem
     exported = []
@@ -614,7 +771,14 @@ def export_particle_systems_split_by_system(
             label = clean_name(f"G{group_index:03d}_{emitter.name}_{target_system.name}")
             filepath = os.path.join(directory, f"{stem}_{label}.abc")
             report = particle_system_report(emitter, target_system)
-            roundtrip = export_particle_hair_as_curves_only(filepath, [emitter], [report], mirror_y_before_export)
+            roundtrip = export_particle_hair_as_curves_only(
+                filepath,
+                [emitter],
+                [report],
+                mirror_y_before_export,
+                groom_width,
+                root_uv_map_name,
+            )
             manifest_path = write_manifest(
                 filepath,
                 {
@@ -679,6 +843,19 @@ class GroomSegmentExporterSettings(PropertyGroup):
         name="Y 坐标镜像补偿",
         default=True,
         description="导出前把最终 Groom 曲线的 Y 坐标乘以 -1，用来抵消 UE Groom 导入后的 Y 方向镜像。",
+    )
+    groom_width: FloatProperty(
+        name="Groom 宽度(cm)",
+        default=0.01,
+        min=0.0001,
+        max=10.0,
+        precision=4,
+        description="写入 Alembic groom_width。UE 使用厘米单位；0.01cm 约等于 0.1mm。",
+    )
+    root_uv_map_name: StringProperty(
+        name="Root UV 贴图",
+        default="",
+        description="用于写入 groom_root_uv 的发射体 UV 贴图名。留空使用活动 UV。",
     )
     preview_bevel_depth: FloatProperty(
         name="预览粗细",
@@ -851,6 +1028,8 @@ class GROOMSEGMENT_OT_export_alembic(Operator):
                 filename,
                 allowed_emitters,
                 settings.mirror_y_before_export,
+                settings.groom_width,
+                settings.root_uv_map_name,
             )
             manifest_path = write_manifest(
                 filepath,
@@ -889,6 +1068,8 @@ class GROOMSEGMENT_OT_export_alembic(Operator):
                 filepath,
                 export_objects,
                 mirror_y_before_export=settings.mirror_y_before_export,
+                groom_width=settings.groom_width,
+                root_uv_map_name=settings.root_uv_map_name,
             )
         else:
             export_selected_alembic(filepath, export_objects, export_hair=export_hair)
@@ -900,6 +1081,8 @@ class GROOMSEGMENT_OT_export_alembic(Operator):
                 "mode": settings.export_mode,
                 "mode_note": "UE Groom Schema 单文件分组会先从 Blender 粒子毛发导出中提取 Alembic Curves，再用专用 writer 写出 ICurves + groom_group_id。原始粒子毛发调试模式可能不会被 UE 识别为 Groom。父发丝检查曲线只包含 parent/guide strands。",
                 "mirror_y_before_export": bool(settings.mirror_y_before_export),
+                "groom_width": float(settings.groom_width),
+                "root_uv_map": settings.root_uv_map_name or "active",
                 "roundtrip_summary": roundtrip_summary,
                 "objects": [
                     {
@@ -944,6 +1127,8 @@ class GROOMSEGMENT_PT_panel(Panel):
         layout.prop(settings, "replace_existing")
         layout.prop(settings, "world_space_curves")
         layout.prop(settings, "mirror_y_before_export")
+        layout.prop(settings, "groom_width")
+        layout.prop(settings, "root_uv_map_name")
         layout.prop(settings, "preview_bevel_depth")
         layout.prop(settings, "max_strands_per_system")
         layout.prop(settings, "minimum_points_per_strand")

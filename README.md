@@ -31,11 +31,14 @@
 5. 设置 `导出目录` 和 `文件名`。
    - `Y 坐标镜像补偿` 默认开启，用来抵消 UE Groom 导入后出现的 Y 方向镜像。
    - 如果某个模型导入 UE 后反而被二次镜像，再关闭这个选项重新导出。
+   - `Groom 宽度(cm)` 会写入 `groom_width`，默认 `0.01cm`。
+   - `Root UV 贴图` 留空时使用发射体活动 UV，并写入每根曲线的 `groom_root_uv`。
 6. 最终导出请优先选择 `UE Groom Schema 单文件分组（推荐）`，然后点击 `导出 UE Groom Alembic`。
    - 插件会先临时导出 Blender 粒子毛发。
    - 再把临时 Alembic 导回 Blender，提取其中真正的 `CURVES` 对象。
    - 最后调用插件自带的 `bin\groom_abc_writer.exe` 写出真正的 UE Groom Alembic schema。
-   - 每个粒子系统会写成一个 `ICurves` 对象，并写入 `groom_group_id`，scope 为 Constant。
+   - 每个粒子系统会写成一个 `ICurves` 对象，并写入 `groom_group_id`、`groom_width`、`groom_root_uv`。
+   - `groom_group_id` 和 `groom_width` 使用 Constant scope；`groom_root_uv` 使用 Uniform scope。
    - 导出前会把对象矩阵和 Y 镜像补偿烘焙进曲线点数据，最终文件为 `+Z 朝上、+Y 朝前`，Curves 对象矩阵为 identity。
 7. 如果单文件 schema writer 出现异常，可临时选择 `按粒子系统拆分文件（备用）`。
    - 每个粒子系统会导出一个独立 curves-only `.abc`。
@@ -60,5 +63,6 @@
 - 导入 `.abc` 时选择 Groom。需要分组时，请优先使用 `UE Groom Schema 单文件分组（推荐）` 导出的单个文件。
 - 如果 UE 导入窗口的 `分组` 里仍只显示一个 `Group_0`，说明导入的不是 schema writer 生成的新文件。
 - 如果 UE 中方向又变成反向镜像，回到 Blender 插件里关闭 `Y 坐标镜像补偿` 后重导。
+- 如果创建 Groom Binding 时提示缺失 `groom_width` 或 `root_uv`，请重新导出当前版本；旧文件没有这两个属性。
 - 检查分段保留效果时，先把导入简化比例调低。
 - 导入后先打开 Groom 资源确认曲线数量和点数量，再创建 Groom Binding。

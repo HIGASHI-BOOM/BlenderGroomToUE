@@ -16,8 +16,10 @@ namespace Ogawa = Alembic::AbcCoreOgawa;
 struct GroupData {
     int32_t group_id = 0;
     std::string name;
+    float width = 0.01f;
     std::vector<Abc::V3f> positions;
     std::vector<int32_t> counts;
+    std::vector<Abc::V2f> root_uvs;
 };
 
 static void WriteGroup(Abc::OObject parent, const GroupData& group)
@@ -48,6 +50,32 @@ static void WriteGroup(Abc::OObject parent, const GroupData& group)
         Abc::Int32ArraySample(&group.group_id, 1),
         AbcGeom::kConstantScope);
     group_param.set(group_sample);
+
+    AbcGeom::OFloatGeomParam width_param(
+        arb,
+        "groom_width",
+        false,
+        AbcGeom::kConstantScope,
+        1);
+    AbcGeom::OFloatGeomParam::Sample width_sample(
+        Abc::FloatArraySample(&group.width, 1),
+        AbcGeom::kConstantScope);
+    width_param.set(width_sample);
+
+    std::vector<Abc::V2f> root_uvs = group.root_uvs;
+    if (root_uvs.size() != group.counts.size()) {
+        root_uvs.assign(group.counts.size(), Abc::V2f(0.0f, 0.0f));
+    }
+    AbcGeom::OV2fGeomParam root_uv_param(
+        arb,
+        "groom_root_uv",
+        false,
+        AbcGeom::kUniformScope,
+        1);
+    AbcGeom::OV2fGeomParam::Sample root_uv_sample(
+        Abc::V2fArraySample(root_uvs),
+        AbcGeom::kUniformScope);
+    root_uv_param.set(root_uv_sample);
 
     // Leave groom_guide absent so Unreal can generate guide strands from the
     // import settings instead of seeing an explicit all-zero guide attribute.
@@ -95,14 +123,21 @@ int main(int argc, char** argv)
         int written_groups = 0;
 
         input >> token;
-        if (token != "GSE_CURVES_V1") {
-            throw std::runtime_error("Input data is not GSE_CURVES_V1.");
+        bool has_root_uv = false;
+        if (token == "GSE_CURVES_V2") {
+            has_root_uv = true;
+        }
+        else if (token != "GSE_CURVES_V1") {
+            throw std::runtime_error("Input data is not GSE_CURVES_V1 or GSE_CURVES_V2.");
         }
 
         while (input >> token) {
             if (token == "GROUP") {
                 FlushGroup(top, group, has_group, written_groups);
                 input >> group.group_id >> group.name;
+                if (has_root_uv) {
+                    input >> group.width;
+                }
                 if (!input) {
                     throw std::runtime_error("Invalid GROUP line.");
                 }
@@ -113,11 +148,17 @@ int main(int argc, char** argv)
                     throw std::runtime_error("CURVE appears before GROUP.");
                 }
                 int32_t count = 0;
+                float root_u = 0.0f;
+                float root_v = 0.0f;
                 input >> count;
+                if (has_root_uv) {
+                    input >> root_u >> root_v;
+                }
                 if (!input || count < 2) {
                     throw std::runtime_error("Invalid CURVE point count.");
                 }
                 group.counts.push_back(count);
+                group.root_uvs.emplace_back(root_u, root_v);
                 for (int32_t i = 0; i < count; ++i) {
                     float x = 0.0f;
                     float y = 0.0f;
