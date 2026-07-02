@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Generated Alembic exports and manifests
+exports/*
+!exports/.gitkeep
+
+# Local Blender/project files
+*.blend
+*.blend1
+
+# Native build artifacts
+*.obj
+*.pdb
+*.ilk
+tools/*.exe
+
+# Keep the packaged writer executable used by the Blender addon.
+!groom_segment_exporter/bin/groom_abc_writer.exe
